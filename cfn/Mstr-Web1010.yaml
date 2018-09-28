@@ -1,0 +1,402 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "This template will deploy a single MicroStrategy Web Server, join it to the Domain and installs the requires binaries."
+Parameters:
+  ServerName:
+    Description: "Hostname for Web Server"
+    Type: "String"
+    Default: "mstr-web1"
+    ConstraintDescription: "Must be a valid Windows hostname."
+  ScriptEnvironment:
+    Description: "Specify the Environment. Used for script mappings/parameters."
+    Type: String
+    AllowedValues:
+    - uat
+    - prod
+    Default: uat
+  NodeInstanceType:
+    Description: "Amazon EC2 instance type for the Intelligence Node Instance"
+    Type: "String"
+    Default: "m5.xlarge"
+    AllowedValues:
+      - "m3.xlarge"
+      - "m3.2xlarge"
+      - "m4.large"
+      - "m4.xlarge"
+      - "m4.2xlarge"
+      - "m5.large"
+      - "m5.xlarge"
+      - "m5.2xlarge"
+      - "r3.xlarge"
+      - "r3.2xlarge"
+  WindowsServerAmiId:
+    Description: "The AMI to use for each windows server instance. Microsoft Windows Server 2016 Base"
+    Type: "String"
+    Default: "ami-0a98eba42e9bf85c9"
+Mappings:
+  ScriptEnvironmentMap:
+    prod:
+      ADDomainJoinUser: "svc_domainjoin"
+      ADDomainControllerIP1: "10.10.10.10"
+      ADDomainControllerIP2: "10.10.11.10"
+      ADDomainDNSName: "prod.mydomain.com"
+      ADDomainNetBIOSName: "prodmydomain"
+      ADOUPath: "OU=MicroStrategy,OU=_Servers,DC=prod,DC=mydomain,DC=com"
+      EC2InstanceProfile: "IAM-MstrWebInstanceProfile"
+      EC2Role: "IAM-MstrWebRole"
+      KeyPairName: "prod-mstr"
+      KMSKeyARN: "arn:aws:kms:us-east-1:123456789123:alias/prod-ebs"
+      S3SoftwareBucketFull: "https://s3-external-1.amazonaws.com/my-software-bucket-prod/"
+      S3SoftwareBucketName: "my-software-bucket-prod"
+      SgEc2Web: "sg-12345678"
+      SubnetWebTier: "subnet-12345678"
+      SiteUrl: "analytics.mydomain.com"
+      VPC: "vpc-12345678"
+    uat:
+      ADDomainJoinUser: "svc_domainjoin"
+      ADDomainControllerIP1: "10.11.10.10"
+      ADDomainControllerIP2: "10.11.11.10"
+      ADDomainDNSName: "uat.mydomain.com"
+      ADDomainNetBIOSName: "prodmydomain"
+      ADOUPath: "OU=MicroStrategy,OU=_Servers,DC=uat,DC=mydomain,DC=com"
+      EC2InstanceProfile: "IAM-MstrWebInstanceProfile"
+      EC2Role: "IAM-MstrWebRole"
+      KeyPairName: "uat-mstr"
+      KMSKeyARN: "arn:aws:kms:us-east-1:123456789123:alias/uat-ebs"
+      S3SoftwareBucketFull: "https://s3-us-west-2.amazonaws.com/my-software-bucket-uat/"
+      S3SoftwareBucketName: "my-software-bucket-uat"
+      SgEc2Web: "sg-12345678"
+      SubnetWebTier: "subnet-12345678"
+      SiteUrl: "analytics.mydomain.com"
+      VPC: "vpc-12345678"
+Resources:
+  MstrWebNode:
+    Type: "AWS::EC2::Instance"
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          config:
+            - setup
+            - staticip
+            - monitoring
+            - configuredisk
+            - renameserver
+            - domainjoin
+            - installbinaries
+            - installmstr
+            - finalize
+        setup:
+          files:
+            c:\\cfn\\cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackName}
+                region=${AWS::Region}
+            c:\\cfn\\hooks.d\\cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.DomainController.Metadata.AWS::CloudFormation::Init
+                action=cfn-init.exe -v -c config -s ${AWS::StackId} -r MstrWebNode --region ${AWS::Region}
+          services:
+            windows:
+              cfn-hup:
+                enabled: "true"
+                ensureRunning: "true"
+                files:
+                  - "c:\\cfn\\cfn-hup.conf"
+                  - "c:\\cfn\\hooks.d\\cfn-auto-reloader.conf"
+        staticip:  # Set the IP as static and the AD servers as DNS
+          files:
+            c:\\bootstrap\\powershell\\Set-StaticIP.ps1:
+              content: !Sub
+                - |
+                  $netip = Get-NetIPConfiguration
+                  $ipconfig = Get-NetIPAddress | ?{$_.IpAddress -eq $netip.IPv4Address.IpAddress}
+                  Get-NetAdapter | Set-NetIPInterface -DHCP Disabled
+                  Get-NetAdapter | New-NetIPAddress -AddressFamily IPv4 -IPAddress $netip.IPv4Address.IpAddress -PrefixLength $ipconfig.PrefixLength -DefaultGateway $netip.IPv4DefaultGateway.NextHop
+                  Get-NetAdapter | Set-DnsClientServerAddress -ServerAddresses ("${ADDomainControllerIP1}","${ADDomainControllerIP2}")
+                  Set-DnsClientGlobalSetting -SuffixSearchList ("${ADDomainDNSName}")
+                - { ADDomainControllerIP1: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, ADDomainControllerIP1], ADDomainControllerIP2: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, ADDomainControllerIP2], ADDomainDNSName: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, ADDomainDNSName] }
+          commands:
+            a-set-static-ip:
+                command: "powershell.exe -ExecutionPolicy RemoteSigned -Command c:\\bootstrap\\powershell\\Set-StaticIP.ps1"
+                waitAfterCompletion: "20"
+        monitoring:  # Configure SSM to forward C:\cfn\log\ logs to CloudWatch. Log group cfninit-Log-Group\{instance_id}\
+          files:
+            C:\\Program Files\\Amazon\\SSM\\Plugins\\awsCloudWatch\\AWS.EC2.Windows.CloudWatch.json:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/powershell/AWS.EC2.Windows.CloudWatch-SSM-",!Ref "AWS::Region",".json"]]
+              authentication: "S3AccessCreds"
+          commands:
+            a-set-cloudwatchmonitoring:
+              command: powershell.exe -ExecutionPolicy RemoteSigned -Command Restart-Service AmazonSSMAgent
+              waitAfterCompletion: "10"
+        configuredisk:
+          files:
+            C:\\bootstrap\\powershell\\add-volumewithdriveletter.ps1:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/powershell/add-volumewithdriveletter.ps1"]]
+              authentication: "S3AccessCreds"
+          commands:
+            d-volume:
+              command: 
+                Fn::Join:
+                  - ""
+                  - - "powershell.exe -ExecutionPolicy RemoteSigned -Command c:\\bootstrap\\powershell\\add-volumewithdriveletter.ps1"
+                    - " -KmsKeyArn "
+                    - !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, KMSKeyARN]
+                    - " -TagValueNodeName "
+                    - !Ref ServerName
+                    - " -VolumeSizeInGb 40"
+                    - " -DriveLetter D"
+              waitAfterCompletion: "5"
+        renameserver:
+          commands:
+            a-disable-win-fw:
+              command: !Sub powershell.exe -Command "Get-NetFirewallProfile | Set-NetFirewallProfile -Enabled False"
+              waitAfterCompletion: "5"
+            b-RenameComputer:
+              command: !Sub powershell.exe Rename-Computer -NewName ${ServerName} -Force -Restart
+              waitAfterCompletion: "60"
+        domainjoin:
+          commands:
+            a-join-domain:
+              command: !Sub
+                - >
+                   powershell.exe -Command "$ADDomainJoinPassword = (Get-SSMParameter -Name "ADDomainJoinPassword" -WithDecryption $True).Value;
+                   Add-Computer -DomainName ${ADDomainDNSName}
+                   -Credential (New-Object System.Management.Automation.PSCredential('${ADDomainNetBIOSName}\${ADDomainJoinUser}',(ConvertTo-SecureString $ADDomainJoinPassword -AsPlainText -Force)))
+                   -OUPath '${ADOUPath}' -Force
+                - { ADDomainDNSName: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, ADDomainDNSName], ADDomainNetBIOSName: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, ADDomainNetBIOSName], ADOUPath: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, ADOUPath], ADDomainJoinUser: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, ADDomainJoinUser] }
+              waitAfterCompletion: "60"
+            b-restart-node:
+              command: "powershell.exe -command Restart-Computer -Force"
+              waitAfterCompletion: "forever"
+            c-registerDNS:
+              command: "ipconfig /registerDNS"
+              waitAfterCompletion: "5"
+            d-flushdns:
+              command: "ipconfig /flushdns"
+              waitAfterCompletion: "5"
+        installbinaries:
+          packages:
+            msi:
+              awscli: "https://s3.amazonaws.com/aws-cli/AWSCLI64.msi"
+          files:
+            c:\\bootstrap\\binaries\\npp.Installer.x64.exe:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/binaries/npp.Installer.x64.exe"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\binaries\\ChromeStandaloneSetup64.exe:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/binaries/ChromeStandaloneSetup64.exe"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\binaries\\7z-x64.exe:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/binaries/7z-x64.exe"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\binaries\\msodbcsql-13.1-x64.msi:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/binaries/msodbcsql-13.1-x64.msi"]]
+              authentication: "S3AccessCreds"
+          commands:
+            a-Create-Logging-Dir:
+              command: "mkdir c:\\bootstrap\\logs"
+              waitAfterCompletion: "10"
+            b-Install-Notepadpp:
+              command: "c:\\bootstrap\\binaries\\npp.Installer.x64.exe /S"
+              waitAfterCompletion: "10"
+            c-Install-Chrome:
+              command: "c:\\bootstrap\\binaries\\ChromeStandaloneSetup64.exe /silent /install"
+              waitAfterCompletion: "60"
+            d-Install-7Zip:
+              command: "c:\\bootstrap\\binaries\\7z-x64.exe /S"
+              waitAfterCompletion: "10"
+            e-install-sqlodbc-driver:
+              command: msiexec /i c:\\bootstrap\\binaries\\msodbcsql-13.1-x64.msi /QN /QUIET IACCEPTMSODBCSQLLICENSETERMS=YES
+              waitAfterCompletion: "5"
+        installmstr:
+          files:
+            c:\\bootstrap\\powershell\\Install-MicrosoftDotNetFramework35.ps1:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/powershell/Install-MicrosoftDotNetFramework35.ps1"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\powershell\\Install-IISWebServices.ps1:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/powershell/Install-IISWebServices.ps1"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\binaries\\AspNetMVC3ToolsUpdateSetup.exe:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/binaries/AspNetMVC3ToolsUpdateSetup.exe"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\binaries\\rewrite_amd64.msi:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/binaries/rewrite_amd64.msi"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\binaries\\MicroStrategy_10.10_Windows.zip:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/binaries/MicroStrategy_10.10_Windows.zip"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\binaries\\workstation-windows-10.10.0.3758.zip:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/binaries/workstation-windows-10.10.0.3758.zip"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\binaries\\mstr_web1010.ini:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/binaries/mstr_web1010.ini"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\powershell\\install-microstrategy.ps1:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/powershell/install-microstrategy.ps1"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\binaries\\10.10.0052.0016_10.10.0_Patch6_Global_Windows.zip:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/binaries/10.10.0052.0016_10.10.0_Patch6_Global_Windows.zip"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\powershell\\install-mstr1010-patch.bat:
+              content: !Sub |
+                copy C:\bootstrap\binaries\microstrategy_patch6\MHDocSrv_64.DLL "C:\Program Files (x86)\Common Files\MicroStrategy\"
+                copy C:\bootstrap\binaries\microstrategy_patch6\MHOBJSRV_64.DLL "C:\Program Files (x86)\Common Files\MicroStrategy\"
+                copy C:\bootstrap\binaries\microstrategy_patch6\MHRPTSRV_64.DLL "C:\Program Files (x86)\Common Files\MicroStrategy\"
+                REM copy C:\bootstrap\binaries\microstrategy_patch6\MJCubSvr_64.DLL "D:\Program Files (x86)\MicroStrategy\Intelligence Server\"
+            c:\\bootstrap\\binaries\\shibboleth-sp-2.6.1.4-win64.msi:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/binaries/shibboleth-sp-2.6.1.4-win64.msi"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\binaries\\shibboleth2.zip:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/binaries/shibboleth2-",!Ref ScriptEnvironment,".zip"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\binaries\\shibbolethcustomsso.zip:
+              source: !Join ["",[ !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketFull],"bootstrap/binaries/shibbolethcustomsso.zip"]]
+              authentication: "S3AccessCreds"
+            c:\\bootstrap\\powershell\\config-iis-shibboleth.bat:
+              content: !Sub |
+                cd C:\Windows\System32\inetsrv
+                appcmd set config /section:isapiFilters /+[name='shibboleth',path='C:\opt\shibboleth-sp\lib64\shibboleth\isapi_shib.dll',preCondition='bitness64']
+                appcmd set config "Default Web Site" /section:handlers /+[name='Shibboleth',path='*.sso',verb='*',modules='IsapiModule',scriptProcessor='C:\opt\shibboleth-sp\lib64\shibboleth\isapi_shib.dll',resourceType='Unspecified',preCondition='bitness64']
+                appcmd set config /section:isapiCgiRestriction /+[path='C:\opt\shibboleth-sp\lib64\shibboleth\isapi_shib.dll',description='Shibboleth',allowed='True']
+                iisreset
+            c:\\bootstrap\\powershell\\add-sslcert.ps1:
+              content: !Sub
+                - |
+                    Import-Module WebAdministration
+                    # Create a Self Signed Cert
+                    $cert=New-SelfSignedCertificate -DnsName "${SiteUrl}" -CertStoreLocation "cert:\LocalMachine\My" -FriendlyName "${SiteUrl}" -NotAfter (Get-Date).AddYears(15)
+                    cd IIS:\SslBindings
+                    # Add Cert to Default Web Site HTTPS binding. Assumes binding exsits.
+                    Get-Item "cert:\LocalMachine\My\$($cert.Thumbprint)" | New-Item 0.0.0.0!443
+                    # BackConnectionHostNames allows URL to be used on localhost otherwise Windows Authentication fails.
+                    Set-ItemProperty -Path HKLM:\HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0 -type multistring -Name "BackConnectionHostNames" -Value "${SiteUrl}"
+                - { SiteUrl: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, SiteUrl] }
+            c:\\bootstrap\\powershell\\config-iis.bat:
+              content: !Sub
+                - |
+                    cd C:\Windows\System32\inetsrv
+                    appcmd set site "/site.name:Default Web Site" /+bindings.[protocol='https',bindingInformation='*:443:${SiteUrl}']
+                    powershell.exe -ExecutionPolicy RemoteSigned -File c:\bootstrap\powershell\add-sslcert.ps1
+                    appcmd.exe set config "Default Web Site/MicroStrategy" -section:system.webServer/security/authentication/anonymousAuthentication /enabled:"true" /commit:apphost
+                    appcmd.exe set config "Default Web Site/MicroStrategy/asp/Admin.aspx" -section:system.webServer/security/authentication/anonymousAuthentication /enabled:"false" /commit:apphost
+                    appcmd.exe set config "Default Web Site/MicroStrategy/asp/Admin.aspx" -section:system.webServer/security/authentication/windowsAuthentication /~"providers" /commit:apphost
+                    appcmd.exe set config "Default Web Site/MicroStrategy/asp/Admin.aspx" -section:system.webServer/security/authentication/windowsAuthentication /+"providers.[value='NTLM']" /commit:apphost
+                    appcmd.exe set config "Default Web Site/MicroStrategy/asp/TaskAdmin.aspx" -section:system.webServer/security/authentication/anonymousAuthentication /enabled:"false" /commit:apphost
+                    appcmd.exe set config "Default Web Site/MicroStrategy/asp/TaskAdmin.aspx" -section:system.webServer/security/authentication/windowsAuthentication /~"providers" /commit:apphost
+                    appcmd.exe set config "Default Web Site/MicroStrategy/asp/TaskAdmin.aspx" -section:system.webServer/security/authentication/windowsAuthentication /+"providers.[value='NTLM']" /commit:apphost
+                    appcmd.exe set config "Default Web Site/MicroStrategy/asp/TaskViewer.aspx" -section:system.webServer/security/authentication/anonymousAuthentication /enabled:"false" /commit:apphost
+                    appcmd.exe set config "Default Web Site/MicroStrategy/asp/TaskViewer.aspx" -section:system.webServer/security/authentication/windowsAuthentication /~"providers" /commit:apphost
+                    appcmd.exe set config "Default Web Site/MicroStrategy/asp/TaskViewer.aspx" -section:system.webServer/security/authentication/windowsAuthentication /+"providers.[value='NTLM']" /commit:apphost
+                    icacls "D:\Program Files (x86)\MicroStrategy\Web ASPx\asp\Admin.aspx" /grant ${MstrAdminGroup}:F
+                    icacls "D:\Program Files (x86)\MicroStrategy\Web ASPx\asp\TaskAdmin.aspx" /grant ${MstrAdminGroup}:F
+                    icacls "D:\Program Files (x86)\MicroStrategy\Web ASPx\asp\TaskViewer.aspx" /grant ${MstrAdminGroup}:F
+                    iisreset
+                - { SiteUrl: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, SiteUrl], MstrAdminGroup: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, MstrAdminGroup]}
+            c:\\bootstrap\\binaries\\Default.htm:
+              content: !Sub |
+                <html xmlns="http://www.w3.org/1999/xhtml">
+                  <head>
+                    <meta http-equiv="refresh" content="0;URL='/MicroStrategy/asp'" />
+                  </head>
+                </html>
+            c:\\bootstrap\\binaries\\healthcheck.html:
+              content: !Sub |
+                <html>
+                <head><title>Healthcheck</title></head>
+                <body>Healthcheck</body>
+                </html>
+          commands:
+            a-install-dotnet:
+              command: "powershell.exe -ExecutionPolicy RemoteSigned -Command c:\\bootstrap\\powershell\\Install-MicrosoftDotNetFramework35.ps1"
+              waitAfterCompletion: "10"
+            b-install-iis:
+              command: "powershell.exe -ExecutionPolicy RemoteSigned -Command c:\\bootstrap\\powershell\\Install-IISWebServices.ps1"
+              waitAfterCompletion: "10"
+            c-install-asp-mvc-tools:
+              command: "c:\\bootstrap\\binaries\\AspNetMVC3ToolsUpdateSetup.exe /q"
+              waitAfterCompletion: "10"
+            d-install-iis-url-rewrite:
+              command: msiexec /i c:\\bootstrap\\binaries\\rewrite_amd64.msi /QN /L*V C:\cfn\log\iis-url-rewrite-install.log
+              waitAfterCompletion: "5"
+            e-extract-microstrategy:
+              command: "powershell.exe -ExecutionPolicy RemoteSigned -Command Expand-Archive -LiteralPath c:\\bootstrap\\binaries\\MicroStrategy_10.10_Windows.zip -DestinationPath C:\\bootstrap\\binaries\\microstrategy_extract\\"
+              waitAfterCompletion: "5"
+            f-install-microstrategy:
+              command: "powershell.exe -ExecutionPolicy RemoteSigned -Command c:\\bootstrap\\powershell\\install-microstrategy.ps1 -ServerType web1010 -LicenseSSMParameter /MICROSTRATEGY/LICENSE_NAMED_USER"
+              waitAfterCompletion: "60"
+            g-extract-microstrategypatch:
+              command: "powershell.exe -ExecutionPolicy RemoteSigned -Command Expand-Archive -LiteralPath c:\\bootstrap\\binaries\\10.10.0052.0016_10.10.0_Patch6_Global_Windows.zip -DestinationPath C:\\bootstrap\\binaries\\microstrategy_patch6\\"
+              waitAfterCompletion: "0"
+            h-install-microstrategypatch:
+              command: "c:\\bootstrap\\powershell\\install-mstr1010-patch.bat"
+              waitAfterCompletion: "0"
+            i-install-shibboleth:
+              command: msiexec /i c:\\bootstrap\\binaries\\shibboleth-sp-2.6.1.4-win64.msi ALWAYS_START_SERVICE=FALSE INSTALL_ISAPI_FILTER=FALSE /norestart /QN /L*V C:\\cfn\\log\\shibboleth-sp-2.6.1.4-win64.msi-install.log
+              waitAfterCompletion: 0
+            j-extract-shibboleth-config:
+              command: "powershell.exe -ExecutionPolicy RemoteSigned -Command Expand-Archive -LiteralPath c:\\bootstrap\\binaries\\shibboleth2.zip -DestinationPath C:\\opt\\shibboleth-sp\\etc\\shibboleth\\ -Force"
+              waitAfterCompletion: 0
+            k-extract-shibboleth-custom-sso:
+              command: "powershell.exe -ExecutionPolicy RemoteSigned -Command Expand-Archive -LiteralPath c:\\bootstrap\\binaries\\shibbolethcustomsso.zip -DestinationPath 'D:\\Program Files (x86)\\MicroStrategy\\Web ASPx\\plugins\\' -Force"
+              waitAfterCompletion: 0
+            l-config-iis-shibboleth:
+              command: "c:\\bootstrap\\powershell\\config-iis-shibboleth.bat"
+              waitAfterCompletion: 0
+            m-set-hostsfile:
+              command: powershell.exe -command Add-Content C:\\Windows\\System32\\drivers\\etc\\hosts \"127.0.0.1 analytics.mydomain.com\"
+              waitAfterCompletion: 0
+            n-config-iis-settings:
+              command: "c:\\bootstrap\\powershell\\config-iis.bat"
+              waitAfterCompletion: 0
+            o-copy-redirect-homepage:
+              command: copy C:\\bootstrap\\binaries\\Default.htm C:\\inetpub\\wwwroot\\
+              waitAfterCompletion: 0
+            p-copy-healthcheck:
+              command: copy C:\\bootstrap\\binaries\\healthcheck.html C:\\inetpub\\wwwroot\\
+              waitAfterCompletion: 0
+        finalize:
+          commands:
+            a-restart-node:
+              command: "powershell.exe Restart-Computer -Force"
+              waitAfterCompletion: "forever"
+            b-SignalSuccess:
+              command: !Sub |
+                cfn-signal.exe --exit-code 0 --region ${AWS::Region} --resource MstrWebNode --stack ${AWS::StackId}
+              waitAfterCompletion: "10"
+      AWS::CloudFormation::Authentication:
+        S3AccessCreds:
+          type: "s3"
+          buckets:
+            - !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, S3SoftwareBucketName]
+          roleName: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, EC2Role]
+    Properties:
+      BlockDeviceMappings: 
+        -
+          DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp2
+      IamInstanceProfile: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, EC2InstanceProfile]
+      ImageId: !Ref WindowsServerAmiId
+      InstanceType: !Ref NodeInstanceType
+      KeyName: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, KeyPairName]
+      SecurityGroupIds: 
+        - !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, SgEc2Web]
+        #SsmAssociations: 
+        #- SSMAssociation
+      SubnetId: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, SubnetWebTier]
+      Tags: 
+        - Key: Name
+          Value: !Ref ServerName
+        - Key: environment
+          Value: !FindInMap [ ScriptEnvironmentMap, !Ref ScriptEnvironment, TagValueEnvironment]
+      UserData:
+        Fn::Base64: !Sub |
+          <script>
+          cfn-init.exe -v -c config -s ${AWS::StackId} -r MstrWebNode --region ${AWS::Region}
+          </script>
+    CreationPolicy:
+      ResourceSignal:    
+        Count: 1
+        Timeout: PT1H
