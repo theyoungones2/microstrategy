@@ -1,0 +1,26 @@
+<Attributes xmlns="urn:mace:shibboleth:2.0:attribute-map" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+    <!--
+    The mappings are a mix of SAML 1.1 and SAML 2.0 attribute names agreed to within the Shibboleth
+    community. The non-OID URNs are SAML 1.1 names and most of the OIDs are SAML 2.0 names, with a
+    few exceptions for newer attributes where the name is the same for both versions. You will
+    usually want to uncomment or map the names for both SAML versions as a unit.
+    -->
+    
+	<!-- <saml2:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">ben.salt@inside.dev.local</saml2:NameID> -->
+    <!-- Fourth, the SAML 2.0 NameID Format: -->
+    <Attribute name="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress" id="emailAddress">
+        <AttributeDecoder xsi:type="NameIDAttributeDecoder" formatter="$NameQualifier!$SPNameQualifier!$Name" defaultQualifiers="true"/>
+    </Attribute>
+	<Attribute nameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:unspecified" name="userName" id="UID">
+        <AttributeDecoder xsi:type="StringAttributeDecoder" caseSensitive="false"/>
+    </Attribute>
+	<Attribute nameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:unspecified" name="firstName" id="FIRST">
+        <AttributeDecoder xsi:type="StringAttributeDecoder" caseSensitive="false"/>
+    </Attribute>
+	<Attribute nameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:unspecified" name="lastName" id="LAST">
+        <AttributeDecoder xsi:type="StringAttributeDecoder" caseSensitive="false"/>
+    </Attribute>
+   
+
+</Attributes>
